@@ -1,0 +1,932 @@
+/****************************************************************************
+*                                                                           *
+*  OpenNI 1.x Alpha                                                         *
+*  Copyright (C) 2011 PrimeSense Ltd.                                       *
+*                                                                           *
+*  This file is part of OpenNI.                                             *
+*                                                                           *
+*  OpenNI is free software: you can redistribute it and/or modify           *
+*  it under the terms of the GNU Lesser General Public License as published *
+*  by the Free Software Foundation, either version 3 of the License, or     *
+*  (at your option) any later version.                                      *
+*                                                                           *
+*  OpenNI is distributed in the hope that it will be useful,                *
+*  but WITHOUT ANY WARRANTY; without even the implied warranty of           *
+*  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the             *
+*  GNU Lesser General Public License for more details.                      *
+*                                                                           *
+*  You should have received a copy of the GNU Lesser General Public License *
+*  along with OpenNI. If not, see <http://www.gnu.org/licenses/>.           *
+*                                                                           *
+****************************************************************************/
+//---------------------------------------------------------------------------
+// Includes
+//---------------------------------------------------------------------------
+#include <math.h>
+#include "SceneDrawer.h"
+#include <sstream>
+#include <sys/socket.h>
+#include <strings.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+// MOD:
+#include <time.h>
+//#include <fstream> // for matlab debugging
+#include <iostream>
+#define PI 3.14159265
+#define tInterval 140 // ms
+#define minVel 1.2 // m/s
+#define EPSILON 0.000001
+#define noOfUsers 3
+//#define maxAngleYX 10 // Max angle b/w Y & X axis to be classified as PUSH
+//#define maxAngleZX 30 // Max angle b/w Z & X axis to be classified as PUSH
+
+#define maxAngleYX 20 // Max angle b/w Y & X axis to be classified as PUSH
+#define maxAngleZX 55 // Max angle b/w Z & X axis to be classified as PUSH
+using namespace std;
+extern ofstream myfile;
+extern int tty_fd;
+
+// ROI (Region of Interest) - for interaction
+#define minZ 1600
+#define maxZ 2700
+
+#define COL1 1850 // (minZ + (maxZ-minZ)/NUMOFCOL) 
+#define COL2 2100 // (minZ + 2*(maxZ-minZ)/NUMOFCOL) 
+#define COL3 2350 // (minZ + 3*(maxZ-minZ)/NUMOFCOL) 
+
+#define YOFFSET -300 // Translation for Yposition 
+
+bool recordWalk = false;
+int prevCol = 0;
+extern int MODE;
+int dirFlag;
+
+clock_t tStartWP;
+#define threshWtoPUSH 500 // threshold from walk to push in ms
+int subMode = 0; // 0: Walk | 1: Push
+
+// Variables which depend on no. of users = record. tStart. pStartR. pStartL. 
+clock_t tStart[noOfUsers], tDiff, tStartDEB;
+int initFlag = 1;
+bool recordPUSH[noOfUsers] = {false};
+XnPoint3D pStartR[noOfUsers], pStartL[noOfUsers];
+XnPoint3D pEndR, pEndL;
+
+#ifndef USE_GLES
+#if (XN_PLATFORM == XN_PLATFORM_MACOSX)
+	#include <GLUT/glut.h>
+#else
+	#include <GL/glut.h>
+#endif
+#else
+	#include "opengles.h"
+#endif
+
+extern xn::UserGenerator g_UserGenerator;
+extern xn::DepthGenerator g_DepthGenerator;
+
+extern XnBool g_bDrawBackground;
+extern XnBool g_bDrawPixels;
+extern XnBool g_bDrawSkeleton;
+extern XnBool g_bPrintID;
+extern XnBool g_bPrintState;
+
+extern XnBool g_bPrintFrameID;
+extern XnBool g_bMarkJoints;
+
+// MOD
+int sendPacketPi(const char* ip, int port, const char* message)
+{
+    int sock;
+    struct sockaddr_in serverAdd;
+    sock = socket(AF_INET,SOCK_DGRAM,0);
+    serverAdd.sin_family = AF_INET;
+    serverAdd.sin_port = port;
+    serverAdd.sin_addr.s_addr = inet_addr(ip);
+    int n = sendto(sock, message, 100, 0, (struct sockaddr*)&serverAdd, sizeof(serverAdd)); 
+    close(sock);
+    return n;
+}
+
+void sendPacket(int* sender, int mode, int col, int dir)
+{
+    std:: stringstream ss;
+    if (mode==1)
+    {
+        ss<<mode<<col<<dir;
+    }
+    if (mode==2)
+    {
+        ss<<mode;
+        if (col<10) { ss<<0<<0<<0; } if (col >=10 && col<100) { ss<<0<<0; } if (col>=100 && col<1000) {ss<<0;}
+        ss<<col;
+        if (dir<10) { ss<<0<<0<<0; } if (dir >=10 && dir<100) { ss<<0<<0; } if (dir>=100 && dir<1000) {ss<<0;}
+        ss<<dir;
+    }
+    if (mode == 3)
+    {
+    	ss<<mode<<dir;
+    }
+    sendPacketPi("158.130.62.100", 5000, ss.str().c_str());
+}
+
+
+#include <map>
+std::map<XnUInt32, std::pair<XnCalibrationStatus, XnPoseDetectionStatus> > m_Errors;
+void XN_CALLBACK_TYPE MyCalibrationInProgress(xn::SkeletonCapability& /*capability*/, XnUserID id, XnCalibrationStatus calibrationError, void* /*pCookie*/)
+{
+	m_Errors[id].first = calibrationError;
+}
+void XN_CALLBACK_TYPE MyPoseInProgress(xn::PoseDetectionCapability& /*capability*/, const XnChar* /*strPose*/, XnUserID id, XnPoseDetectionStatus poseError, void* /*pCookie*/)
+{
+	m_Errors[id].second = poseError;
+}
+
+unsigned int getClosestPowerOfTwo(unsigned int n)
+{
+	unsigned int m = 2;
+	while(m < n) m<<=1;
+
+	return m;
+}
+GLuint initTexture(void** buf, int& width, int& height)
+{
+	GLuint texID = 0;
+	glGenTextures(1,&texID);
+
+	width = getClosestPowerOfTwo(width);
+	height = getClosestPowerOfTwo(height); 
+	*buf = new unsigned char[width*height*4];
+	glBindTexture(GL_TEXTURE_2D,texID);
+
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+	return texID;
+}
+
+GLfloat texcoords[8];
+void DrawRectangle(float topLeftX, float topLeftY, float bottomRightX, float bottomRightY)
+{
+	GLfloat verts[8] = {	topLeftX, topLeftY,
+		topLeftX, bottomRightY,
+		bottomRightX, bottomRightY,
+		bottomRightX, topLeftY
+	};
+	glVertexPointer(2, GL_FLOAT, 0, verts);
+	glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+
+	//TODO: Maybe glFinish needed here instead - if there's some bad graphics crap
+	glFlush();
+}
+void DrawTexture(float topLeftX, float topLeftY, float bottomRightX, float bottomRightY)
+{
+	glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+	glTexCoordPointer(2, GL_FLOAT, 0, texcoords);
+
+	DrawRectangle(topLeftX, topLeftY, bottomRightX, bottomRightY);
+
+	glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+}
+
+XnFloat Colors[][3] =
+{
+	{0,1,1},
+	{0,0,1},
+	{0,1,0},
+	{1,1,0},
+	{1,0,0},
+	{1,.5,0},
+	{.5,1,0},
+	{0,.5,1},
+	{.5,0,1},
+	{1,1,.5},
+	{1,1,1}
+};
+XnUInt32 nColors = 10;
+#ifndef USE_GLES
+void glPrintString(void *font, char *str)
+{
+	int i,l = (int)strlen(str);
+
+	for(i=0; i<l; i++)
+	{
+		glutBitmapCharacter(font,*str++);
+	}
+}
+#endif
+bool DrawLimb(XnUserID player, XnSkeletonJoint eJoint1, XnSkeletonJoint eJoint2)
+{
+	if (!g_UserGenerator.GetSkeletonCap().IsTracking(player))
+	{
+		printf("not tracked!\n");
+		return true;
+	}
+
+	if (!g_UserGenerator.GetSkeletonCap().IsJointActive(eJoint1) ||
+		!g_UserGenerator.GetSkeletonCap().IsJointActive(eJoint2))
+	{
+		return false;
+	}
+
+	XnSkeletonJointPosition joint1, joint2;
+	g_UserGenerator.GetSkeletonCap().GetSkeletonJointPosition(player, eJoint1, joint1);
+	g_UserGenerator.GetSkeletonCap().GetSkeletonJointPosition(player, eJoint2, joint2);
+
+	if (joint1.fConfidence < 0.5 || joint2.fConfidence < 0.5)
+	{
+		return true;
+	}
+
+	XnPoint3D pt[2];
+	pt[0] = joint1.position;
+	pt[1] = joint2.position;
+
+	g_DepthGenerator.ConvertRealWorldToProjective(2, pt, pt);
+#ifndef USE_GLES
+	glVertex3i(pt[0].X, pt[0].Y, 0);
+	glVertex3i(pt[1].X, pt[1].Y, 0);
+#else
+	GLfloat verts[4] = {pt[0].X, pt[0].Y, pt[1].X, pt[1].Y};
+	glVertexPointer(2, GL_FLOAT, 0, verts);
+	glDrawArrays(GL_LINES, 0, 2);
+	glFlush();
+#endif
+
+	return true;
+}
+// Max angle b/w Y & Z axis to be classified as PUSH
+static const float DEG2RAD = 3.14159/180;
+ 
+void drawCircle(float x, float y, float radius)
+{
+   glBegin(GL_TRIANGLE_FAN);
+ 
+   for (int i=0; i < 360; i++)
+   {
+      float degInRad = i*DEG2RAD;
+      glVertex2f(x + cos(degInRad)*radius, y + sin(degInRad)*radius);
+   }
+ 
+   glEnd();
+}
+void DrawJoint(XnUserID player, XnSkeletonJoint eJoint)
+{
+	if (!g_UserGenerator.GetSkeletonCap().IsTracking(player))
+	{
+		printf("not tracked!\n");
+		return;
+	}
+
+	if (!g_UserGenerator.GetSkeletonCap().IsJointActive(eJoint))
+	{
+		return;
+	}
+
+	XnSkeletonJointPosition joint;
+	g_UserGenerator.GetSkeletonCap().GetSkeletonJointPosition(player, eJoint, joint);
+
+	if (joint.fConfidence < 0.5)
+	{
+		return;
+	}
+
+	XnPoint3D pt;
+	pt = joint.position;
+
+	g_DepthGenerator.ConvertRealWorldToProjective(1, &pt, &pt);
+
+	drawCircle(pt.X, pt.Y, 2);
+}
+
+const XnChar* GetCalibrationErrorString(XnCalibrationStatus error)
+{
+	switch (error)
+	{
+	case XN_CALIBRATION_STATUS_OK:
+		return "OK";
+	case XN_CALIBRATION_STATUS_NO_USER:
+		return "NoUser";
+	case XN_CALIBRATION_STATUS_ARM:
+		return "Arm";
+	case XN_CALIBRATION_STATUS_LEG:
+		return "Leg";
+	case XN_CALIBRATION_STATUS_HEAD:
+		return "Head";
+	case XN_CALIBRATION_STATUS_TORSO:
+		return "Torso";
+	case XN_CALIBRATION_STATUS_TOP_FOV:
+		return "Top FOV";
+	case XN_CALIBRATION_STATUS_SIDE_FOV:
+		return "Side FOV";
+	case XN_CALIBRATION_STATUS_POSE:
+		return "Pose";
+	default:
+		return "Unknown";
+	}
+}
+const XnChar* GetPoseErrorString(XnPoseDetectionStatus error)
+{
+	switch (error)
+	{
+	case XN_POSE_DETECTION_STATUS_OK:
+		return "OK";
+	case XN_POSE_DETECTION_STATUS_NO_USER:
+		return "NoUser";
+	case XN_POSE_DETECTION_STATUS_TOP_FOV:
+		return "Top FOV";
+	case XN_POSE_DETECTION_STATUS_SIDE_FOV:
+		return "Side FOV";
+	case XN_POSE_DETECTION_STATUS_ERROR:
+		return "General error";
+	default:
+		return "Unknown";
+	}
+}
+
+// MOD: 
+// Not a very efficient method - Dependent on system being used. 
+
+// Change: Variables which depend on no. of users = record. tStart. pStartR. pStartL. 
+bool push(XnPoint3D* handR, XnPoint3D* handL, XnUserID userID)
+{
+	// If not recording then initialize start time & start point.
+	if (!recordPUSH[userID-1]) 
+    {
+      tStart[userID-1] = clock();
+      pStartR[userID-1] = *handR; pStartL[userID-1] = *handL;
+      recordPUSH[userID-1] = true;
+      printf("----------------------------------------\n");
+    }
+
+  tDiff= clock() - tStart[userID-1];
+  
+  float tDiffMS = ((float)tDiff)/(CLOCKS_PER_SEC/1000.0);
+  if ( tDiffMS > tInterval) // At the end of tInterval
+  {
+  	pEndR = *handR; pEndL = *handL;
+  	// distance (mm -> m) / time (ms -> s)
+  	float velR = - (pEndR.X - pStartR[userID-1].X)  / (tDiffMS) ;
+  	float velL = - (pEndL.X - pStartL[userID-1].X)  / (tDiffMS) ;
+  	
+  	float angleY_R = atan ((pStartR[userID-1].Y - pEndR.Y) / (pStartR[userID-1].X - pEndR.X)) * 180 / PI;
+  	float angleZ_R = atan ((pStartR[userID-1].Z - pEndR.Z) / (pStartR[userID-1].X - pEndR.X)) * 180 / PI;
+  	
+  	float angleY_L = atan ((pStartL[userID-1].Y - pEndL.Y) / (pStartL[userID-1].X - pEndL.X)) * 180 / PI;
+  	float angleZ_L = atan ((pStartL[userID-1].Z - pEndL.Z) / (pStartL[userID-1].X - pEndL.X)) * 180 / PI;
+  	
+  	//if ( ( (velR > minVel) && (fabs(pEndR.X - pStartR.X) > fabs(pEndR.Y-pStartR.Y)) && (fabs(pEndR.X-pStartR.X) > fabs(pEndR.Z-pStartR.Z)) ) || ( (velL > minVel) && (fabs(pEndL.X - pStartL.X) > fabs(pEndL.Y-pStartL.Y)) && (fabs(pEndL.X-pStartL.X) > fabs(pEndL.Z-pStartL.Z)) ) /*&& (abs(angleX) < maxAngleXZ) && (abs(angleY) < maxAngleYZ)*/ )
+  	if ( ( (velR > minVel)  && ((angleY_R) < maxAngleYX) && (abs(angleZ_R) < maxAngleZX) ) || ( (velL > minVel) && (abs(angleY_L) < maxAngleYX)  && (abs(angleZ_L) < maxAngleZX) ) )
+	{
+  		//float angleY = atan ((pStart.Y - pEnd.Y) / (pStart.Z - pEnd.Z)) * 180 / PI;
+  		//float angleX = atan ((pStart.X - pEnd.X) / (pStart.Z - pEnd.Z)) * 180 / PI;
+  		// hand = 1 - Right | 0 - Left
+  		bool hand = (velR - velL) > EPSILON ? 1 : 0;
+  		if (hand)
+  			{
+  			sendPacket(&tty_fd,2,abs((int)pEndR.Y + YOFFSET),abs((int)pEndR.Z));
+  			//printf("User %d PUSHED! with velocity L: %f R: %f~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ RIGHT | Y: %f | Z: %f", userID, velL, velR, angleY_R, angleZ_R);
+  			printf("User %d PUSHED! with velocity L: %f R: %f~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ RIGHT | Y: %d | Z: %d", userID, velL, velR, abs((int)pEndR.Y + YOFFSET), abs((int)pEndR.Z));
+  			}
+  		else
+  		{
+  			sendPacket(&tty_fd,2,abs((int)pEndL.Y + YOFFSET),abs((int)pEndL.Z));
+  			//printf("User %d PUSHED! with velocity L: %f R: %f~ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ LEFT | Y: %f | Z: %f", userID, velL, velR, angleY_L, angleZ_L);
+  			printf("User %d PUSHED! with velocity L: %f R: %f~ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ LEFT | Y: %d | Z: %d", userID, velL, velR, abs((int)pEndL.Y + YOFFSET), abs((int)pEndL.Z));
+  		}
+  		recordPUSH[userID-1] = false; 
+  		//
+  		return true; 
+  	}	
+  	recordPUSH[userID-1] = false; 
+  }
+  return false;
+
+}
+
+// If point (here COM) is within ROI i.e within the region of the panels
+bool withinROI (XnPoint3D* com)
+{
+	if ((*com).Z >= minZ && (*com).Z <=maxZ) return true;
+	return false;
+}
+
+// Returns which column does the person lie in (1.2.3.4)
+int withinCol(XnPoint3D* com)
+{
+	if ((*com).Z >= minZ && (*com).Z <= COL1) { return 1; }
+	if ((*com).Z >= COL1 && (*com).Z <= COL2) { return 2; }
+	if ((*com).Z >= COL2 && (*com).Z <= COL3) { return 3; }
+	if ((*com).Z >= COL3 && (*com).Z <= maxZ) { return 4; }
+}
+
+// Send data serially to mbed containing the actuation information - {col.dirflag}
+void actuateWalk(int col, int dirFlag)
+{
+
+	if (dirFlag==0)
+		{
+		printf("WALK!------------------ COLUMN %d ############## DIRECTION %d\n",col, dirFlag);
+		}
+	else
+	{
+		printf("WALK!------------------ COLUMN %d ______________ DIRECTION %d\n",col, dirFlag);
+	}
+
+	sendPacket(&tty_fd,1,col,dirFlag);
+}
+
+void DrawDepthMap(const xn::DepthMetaData& dmd, const xn::SceneMetaData& smd)
+{
+	static bool bInitialized = false;	
+	static GLuint depthTexID;
+	static unsigned char* pDepthTexBuf;
+	static int texWidth, texHeight;
+
+	float topLeftX;
+	float topLeftY;
+	float bottomRightY;
+	float bottomRightX;
+	float texXpos;
+	float texYpos;
+
+	if(!bInitialized)
+	{
+		texWidth =  getClosestPowerOfTwo(dmd.XRes());
+		texHeight = getClosestPowerOfTwo(dmd.YRes());
+
+//		printf("Initializing depth texture: width = %d, height = %d\n", texWidth, texHeight);
+		depthTexID = initTexture((void**)&pDepthTexBuf,texWidth, texHeight) ;
+
+//		printf("Initialized depth texture: width = %d, height = %d\n", texWidth, texHeight);
+		bInitialized = true;
+
+		topLeftX = dmd.XRes();
+		topLeftY = 0;
+		bottomRightY = dmd.YRes();
+		bottomRightX = 0;
+		texXpos =(float)dmd.XRes()/texWidth;
+		texYpos  =(float)dmd.YRes()/texHeight;
+
+		memset(texcoords, 0, 8*sizeof(float));
+		texcoords[0] = texXpos, texcoords[1] = texYpos, texcoords[2] = texXpos, texcoords[7] = texYpos;
+	}
+
+	unsigned int nValue = 0;
+	unsigned int nHistValue = 0;
+	unsigned int nIndex = 0;
+	unsigned int nX = 0;
+	unsigned int nY = 0;
+	unsigned int nNumberOfPoints = 0;
+	XnUInt16 g_nXRes = dmd.XRes();
+	XnUInt16 g_nYRes = dmd.YRes();
+
+	unsigned char* pDestImage = pDepthTexBuf;
+
+	const XnDepthPixel* pDepth = dmd.Data();
+	const XnLabel* pLabels = smd.Data();
+
+	static unsigned int nZRes = dmd.ZRes();
+	static float* pDepthHist = (float*)malloc(nZRes* sizeof(float));
+
+	// Calculate the accumulative histogram
+	memset(pDepthHist, 0, nZRes*sizeof(float));
+	for (nY=0; nY<g_nYRes; nY++)
+	{
+		for (nX=0; nX<g_nXRes; nX++)
+		{
+			nValue = *pDepth;
+
+			if (nValue != 0)
+			{
+				pDepthHist[nValue]++;
+				nNumberOfPoints++;
+			}
+
+			pDepth++;
+		}
+	}
+
+	for (nIndex=1; nIndex<nZRes; nIndex++)
+	{
+		pDepthHist[nIndex] += pDepthHist[nIndex-1];
+	}
+	if (nNumberOfPoints)
+	{
+		for (nIndex=1; nIndex<nZRes; nIndex++)
+		{
+			pDepthHist[nIndex] = (unsigned int)(256 * (1.0f - (pDepthHist[nIndex] / nNumberOfPoints)));
+		}
+	}
+
+	pDepth = dmd.Data();
+	if (g_bDrawPixels)
+	{
+		XnUInt32 nIndex = 0;
+		// Prepare the texture map
+		for (nY=0; nY<g_nYRes; nY++)
+		{
+			for (nX=0; nX < g_nXRes; nX++, nIndex++)
+			{
+
+				pDestImage[0] = 0;
+				pDestImage[1] = 0;
+				pDestImage[2] = 0;
+				if (g_bDrawBackground || *pLabels != 0)
+				{
+					nValue = *pDepth;
+					XnLabel label = *pLabels;
+					XnUInt32 nColorID = label % nColors;
+					if (label == 0)
+					{
+						nColorID = nColors;
+					}
+
+					if (nValue != 0)
+					{
+						nHistValue = pDepthHist[nValue];
+
+						pDestImage[0] = nHistValue * Colors[nColorID][0]; 
+						pDestImage[1] = nHistValue * Colors[nColorID][1];
+						pDestImage[2] = nHistValue * Colors[nColorID][2];
+					}
+				}
+
+				pDepth++;
+				pLabels++;
+				pDestImage+=3;
+			}
+
+			pDestImage += (texWidth - g_nXRes) *3;
+		}
+	}
+	else
+	{
+		xnOSMemSet(pDepthTexBuf, 0, 3*2*g_nXRes*g_nYRes);
+	}
+
+	glBindTexture(GL_TEXTURE_2D, depthTexID);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, texWidth, texHeight, 0, GL_RGB, GL_UNSIGNED_BYTE, pDepthTexBuf);
+
+	// Display the OpenGL texture map
+	glColor4f(0.75,0.75,0.75,1);
+
+	glEnable(GL_TEXTURE_2D);
+	DrawTexture(dmd.XRes(),dmd.YRes(),0,0);	
+	glDisable(GL_TEXTURE_2D);
+
+	char strLabel[50], strLabelL[50], strLabelR[50], strLabelCOM[50] = "";
+	XnUserID aUsers[noOfUsers];
+	XnUInt16 nUsers = noOfUsers;
+	g_UserGenerator.GetUsers(aUsers, nUsers);
+	// Mod:
+	XnSkeletonJointTransformation handJointR, handJointL;
+
+	for (int i = 0; i < nUsers; ++i)
+	{
+#ifndef USE_GLES
+		if (g_bPrintID)
+		{
+			XnPoint3D comR, comL, com;
+			// Mod:
+			g_UserGenerator.GetSkeletonCap().GetSkeletonJoint(aUsers[i], XN_SKEL_RIGHT_HAND, handJointR);
+			g_UserGenerator.GetSkeletonCap().GetSkeletonJoint(aUsers[i], XN_SKEL_LEFT_HAND, handJointL);
+			comR.X = handJointR.position.position.X;
+			comR.Y = handJointR.position.position.Y;
+			comR.Z = handJointR.position.position.Z;
+			comL.X = handJointL.position.position.X;
+			comL.Y = handJointL.position.position.Y;
+			comL.Z = handJointL.position.position.Z;
+
+			
+			g_UserGenerator.GetCoM(aUsers[i], com);
+			g_DepthGenerator.ConvertRealWorldToProjective(1, &com, &com);
+
+			//g_DepthGenerator.ConvertRealWorldToProjective(1, &comR, &comR);
+			//g_DepthGenerator.ConvertRealWorldToProjective(1, &comL, &comL);
+			// Temp:
+			//g_DepthGenerator.ConvertRealWorldToProjective(1, &comR, &comR);
+			
+			XnUInt32 nDummy = 0;
+
+
+			xnOSMemSet(strLabel, 0, sizeof(strLabelR));
+			xnOSMemSet(strLabel, 0, sizeof(strLabelL));
+			xnOSMemSet(strLabelCOM, 0, sizeof(strLabelCOM));
+			if (!g_bPrintState)
+			{
+				// Tracking
+				xnOSStrFormat(strLabel, sizeof(strLabel), &nDummy, "%d", aUsers[i]);
+			}
+			else if (g_UserGenerator.GetSkeletonCap().IsTracking(aUsers[i]))
+			{
+				// Tracking
+				xnOSStrFormat(strLabel, sizeof(strLabel), &nDummy, "%d - Tracking", aUsers[i]);
+				
+				printf("User %d at (%6.2f,%6.2f(%d),%6.2f)\n", aUsers[i], comR.X, comR.Y, abs((int)comR.Y + YOFFSET), comR.Z);
+
+				// Reset flags if not within ROI
+				if (!withinROI(&com))
+				{
+					prevCol = 0;
+					subMode = 0; // 0: Walk | 1: Push
+					recordWalk = false;
+				}
+				// MODE 1 : Walk (Placement from L:R - columns maxZ.3.2.1.minZ__Kinect)
+				if ((MODE == 1) && withinROI(&com))
+				{
+					// Init: Set direction flag- 0: Farther from kinect | 1: Near to kinect 
+					if (!recordWalk) { dirFlag = abs(com.Z - minZ) < abs(maxZ - com.Z) ? 1:0; recordWalk = true; }
+					if ( withinCol(&com) == 1 && prevCol != 1)
+					{
+						// Send serial data for actuation of COL 1 | dirFlag 
+						actuateWalk(1, dirFlag);
+						prevCol = 1;
+						// End condition: If walked from col4 start recording again
+						if (dirFlag == 0) { recordWalk = false; }	
+					}
+
+					if ( withinCol(&com) == 2 && prevCol != 2)
+					{
+						// Send serial data for actuation of COL 2 | dirFlag 
+						actuateWalk(2, dirFlag);
+						prevCol = 2;
+					}
+					if ( withinCol(&com) == 3 && prevCol != 3)
+					{
+						// Send serial data for actuation of COL 3 | dirFlag
+						actuateWalk(3, dirFlag); 
+						prevCol = 3;
+					}
+					if ( withinCol(&com) == 4 && prevCol != 4)
+					{
+						// Send serial data for actuation of COL 4 | dirFlag
+						actuateWalk(4, dirFlag);
+						prevCol = 4;
+						// End condition: If walked from col1 start recording again
+						if (dirFlag == 1) { recordWalk = false; }
+					}
+				}
+
+				// MODE 2: Push!
+				if (MODE == 2 && withinROI(&com))
+				{
+					//Mod PUSH:
+					XnSkeletonJointPosition jointL, jointR;
+					g_UserGenerator.GetSkeletonCap().GetSkeletonJointPosition(aUsers[i], XN_SKEL_LEFT_HAND, jointL);
+					g_UserGenerator.GetSkeletonCap().GetSkeletonJointPosition(aUsers[i], XN_SKEL_RIGHT_HAND, jointR);
+					//printf("Joint confidence L: %f R: %f\n", jointL.fConfidence, jointR.fConfidence);
+					if (jointL.fConfidence >= 1 || jointR.fConfidence >= 1) 
+					{
+						if (push(&comR, &comL, aUsers[i])) { printf("PUSHED!\n"); } 
+					}
+					// else stop recording
+					else { recordPUSH[aUsers[i]-1] = false; }
+				}
+
+				// MODE 3 : Linear smooth Walk (Placement from L:R - columns maxZ.3.2.1.minZ__Kinect)
+				if (MODE == 3 && withinROI(&com))
+				{
+					// Init: Set direction flag- 0: Farther from kinect | 1: Near to kinect 
+					if (!recordWalk) { dirFlag = abs(com.Z - minZ) < abs(maxZ - com.Z) ? 1:0; recordWalk = true; }
+					if ( withinCol(&com) == 1 && prevCol != 1)
+					{
+						// Send serial data for actuation of COL 1 | dirFlag 
+						
+						prevCol = 1;
+						// End condition: If walked from col4 start recording again
+						if (dirFlag == 0) { recordWalk = false; }
+						else { sendPacket(&tty_fd, 3, 0, dirFlag); }	
+					}
+
+					if ( withinCol(&com) == 4 && prevCol != 4)
+					{
+						// Send serial data for actuation of COL 4 | dirFlag
+						
+						prevCol = 4;
+						// End condition: If walked from col1 start recording again
+						if (dirFlag == 1) { recordWalk = false; }
+						else { sendPacket(&tty_fd, 3, 0, dirFlag); }
+					}
+				}
+
+				// Disabled for now!
+				/*
+				// MODE 3: Walk + Push!
+				if (MODE == 3 && withinROI(&com))
+				{
+					// Init: Set direction flag- 0: Farther from kinect | 1: Near to kinect 
+					if (!recordWalk) { dirFlag = abs(com.Z - minZ) < abs(maxZ - com.Z) ? 1:0; tStartWP = clock(); recordWalk = true; }
+					if (subMode == 0) // Walk
+					{
+						clock_t tDiffWP = clock() - tStartWP;
+	  					float tDiffMS = ((float)tDiffWP)/(CLOCKS_PER_SEC/1000.0);
+
+	  					if (tDiffMS > threshWtoPUSH) { subMode = 1; }
+	  				
+						if ( withinCol(&com) == 1 && prevCol != 1)
+						{
+							// Send serial data for actuation of COL 1 | dirFlag 
+							actuateWalk(1, dirFlag);
+							tStartWP = clock(); // Reset timer
+							prevCol = 1;
+							// End condition: If walked from col4 start recording again
+							if (dirFlag == 0) { recordWalk = false; }	
+						}
+
+						if ( withinCol(&com) == 2 && prevCol != 2)
+						{
+							// Send serial data for actuation of COL 2 | dirFlag 
+							actuateWalk(2, dirFlag);
+							tStartWP = clock(); // Reset timer
+							prevCol = 2;
+						}
+						if ( withinCol(&com) == 3 && prevCol != 3)
+						{
+							// Send serial data for actuation of COL 3 | dirFlag
+							actuateWalk(3, dirFlag);
+							tStartWP = clock(); // Reset timer 
+							prevCol = 3;
+						}
+						if ( withinCol(&com) == 4 && prevCol != 4)
+						{
+							// Send serial data for actuation of COL 4 | dirFlag
+							actuateWalk(4, dirFlag);
+							tStartWP = clock(); // Reset timer
+							prevCol = 4;
+							// End condition: If walked from col1 start recording again
+							if (dirFlag == 1) { recordWalk = false; }
+						}
+					}
+					else // if > threshWtoPUSH -> PUSH | subMode = 1 // 0: Walk | 1: Push
+					{
+						//Mod PUSH:
+						XnSkeletonJointPosition jointL, jointR;
+						g_UserGenerator.GetSkeletonCap().GetSkeletonJointPosition(aUsers[i], XN_SKEL_LEFT_HAND, jointL);
+						g_UserGenerator.GetSkeletonCap().GetSkeletonJointPosition(aUsers[i], XN_SKEL_RIGHT_HAND, jointR);
+						//printf("Joint confidence L: %f R: %f\n", jointL.fConfidence, jointR.fConfidence);
+						if (jointL.fConfidence >= 1 || jointR.fConfidence >= 1) 
+						{
+							if (push(&comR, &comL, aUsers[i])) { printf("PUSHED!\n"); } 
+						}
+						// else stop recording
+						else { recordPUSH[aUsers[i]-1] = false; }
+					}
+				}
+
+				*/
+
+				// // Debugging ->MATLAB
+				// if (initFlag) { tStartDEB = clock(); initFlag = 0;} // initial setup
+				
+				// int crap;
+				// clock_t tDiffDEB = clock() - tStartDEB;
+				// float tDiffDEBs = ((float)tDiffDEB)/(CLOCKS_PER_SEC);
+				// if (tDiffDEBs > 20) { myfile.close(); printf("DONE!!!!!!!!!!!!!!!!!!!!!"); crap = 1;}
+				// else { myfile << com.Z << "\n"; crap = 0;}
+
+				//printf("User %d at (%6.2f,%6.2f,%6.2f) \t %d \t %f\n", aUsers[i], comR.X, comR.Y, comR.Z, crap, tDiffDEBs);
+				//printf("User %d at (%6.2f,%6.2f,%6.2f)\n", aUsers[i], comR.X, comR.Y, comR.Z);
+				
+				
+			}
+			else if (g_UserGenerator.GetSkeletonCap().IsCalibrating(aUsers[i]))
+			{
+				// Calibrating
+				xnOSStrFormat(strLabel, sizeof(strLabel), &nDummy, "%d - Calibrating [%s]", aUsers[i], GetCalibrationErrorString(m_Errors[aUsers[i]].first));
+			}
+			else
+			{
+				// Nothing
+				xnOSStrFormat(strLabel, sizeof(strLabel), &nDummy, "%d - Looking for pose [%s]", aUsers[i], GetPoseErrorString(m_Errors[aUsers[i]].second));
+			}
+			
+			
+
+			glColor4f(1-Colors[i%nColors][0], 1-Colors[i%nColors][1], 1-Colors[i%nColors][2], 1);
+
+			g_DepthGenerator.ConvertRealWorldToProjective(1, &comR, &comR);
+			g_DepthGenerator.ConvertRealWorldToProjective(1, &comL, &comL);
+			
+			// For right hand
+			xnOSStrFormat(strLabelR, sizeof(strLabelR), &nDummy, "%d - TrackingR", aUsers[i]);
+			
+			glRasterPos2i(comR.X, comR.Y);
+			glPrintString(GLUT_BITMAP_HELVETICA_18, strLabelR);
+
+			// For left hand
+			xnOSStrFormat(strLabelL, sizeof(strLabelL), &nDummy, "%d - TrackingL", aUsers[i]);
+			
+			glRasterPos2i(comL.X, comL.Y);
+			glPrintString(GLUT_BITMAP_HELVETICA_18, strLabelL);
+
+			// For COM
+			xnOSStrFormat(strLabelCOM, sizeof(strLabelCOM), &nDummy, "%d - COM", aUsers[i]);
+			glRasterPos2i(com.X, com.Y);
+			glPrintString(GLUT_BITMAP_HELVETICA_18, strLabelCOM);
+		}
+#endif
+		if (g_bDrawSkeleton && g_UserGenerator.GetSkeletonCap().IsTracking(aUsers[i]))
+		{
+			glColor4f(1-Colors[aUsers[i]%nColors][0], 1-Colors[aUsers[i]%nColors][1], 1-Colors[aUsers[i]%nColors][2], 1);
+
+			// Draw Joints
+			if (g_bMarkJoints)
+			{
+				// Try to draw all joints
+				DrawJoint(aUsers[i], XN_SKEL_HEAD);
+				DrawJoint(aUsers[i], XN_SKEL_NECK);
+				DrawJoint(aUsers[i], XN_SKEL_TORSO);
+				DrawJoint(aUsers[i], XN_SKEL_WAIST);
+
+				DrawJoint(aUsers[i], XN_SKEL_LEFT_COLLAR);
+				DrawJoint(aUsers[i], XN_SKEL_LEFT_SHOULDER);
+				DrawJoint(aUsers[i], XN_SKEL_LEFT_ELBOW);
+				DrawJoint(aUsers[i], XN_SKEL_LEFT_WRIST);
+				DrawJoint(aUsers[i], XN_SKEL_LEFT_HAND);
+				DrawJoint(aUsers[i], XN_SKEL_LEFT_FINGERTIP);
+
+				DrawJoint(aUsers[i], XN_SKEL_RIGHT_COLLAR);
+				DrawJoint(aUsers[i], XN_SKEL_RIGHT_SHOULDER);
+				DrawJoint(aUsers[i], XN_SKEL_RIGHT_ELBOW);
+				DrawJoint(aUsers[i], XN_SKEL_RIGHT_WRIST);
+				DrawJoint(aUsers[i], XN_SKEL_RIGHT_HAND);
+				DrawJoint(aUsers[i], XN_SKEL_RIGHT_FINGERTIP);
+
+				DrawJoint(aUsers[i], XN_SKEL_LEFT_HIP);
+				DrawJoint(aUsers[i], XN_SKEL_LEFT_KNEE);
+				DrawJoint(aUsers[i], XN_SKEL_LEFT_ANKLE);
+				DrawJoint(aUsers[i], XN_SKEL_LEFT_FOOT);
+
+				DrawJoint(aUsers[i], XN_SKEL_RIGHT_HIP);
+				DrawJoint(aUsers[i], XN_SKEL_RIGHT_KNEE);
+				DrawJoint(aUsers[i], XN_SKEL_RIGHT_ANKLE);
+				DrawJoint(aUsers[i], XN_SKEL_RIGHT_FOOT);
+			}
+
+#ifndef USE_GLES
+			glBegin(GL_LINES);
+#endif
+
+			// Draw Limbs
+			DrawLimb(aUsers[i], XN_SKEL_HEAD, XN_SKEL_NECK);
+
+			DrawLimb(aUsers[i], XN_SKEL_NECK, XN_SKEL_LEFT_SHOULDER);
+			DrawLimb(aUsers[i], XN_SKEL_LEFT_SHOULDER, XN_SKEL_LEFT_ELBOW);
+			if (!DrawLimb(aUsers[i], XN_SKEL_LEFT_ELBOW, XN_SKEL_LEFT_WRIST))
+			{
+				DrawLimb(aUsers[i], XN_SKEL_LEFT_ELBOW, XN_SKEL_LEFT_HAND);
+			}
+			else
+			{
+				DrawLimb(aUsers[i], XN_SKEL_LEFT_WRIST, XN_SKEL_LEFT_HAND);
+				DrawLimb(aUsers[i], XN_SKEL_LEFT_HAND, XN_SKEL_LEFT_FINGERTIP);
+			}
+
+
+			DrawLimb(aUsers[i], XN_SKEL_NECK, XN_SKEL_RIGHT_SHOULDER);
+			DrawLimb(aUsers[i], XN_SKEL_RIGHT_SHOULDER, XN_SKEL_RIGHT_ELBOW);
+			if (!DrawLimb(aUsers[i], XN_SKEL_RIGHT_ELBOW, XN_SKEL_RIGHT_WRIST))
+			{
+				DrawLimb(aUsers[i], XN_SKEL_RIGHT_ELBOW, XN_SKEL_RIGHT_HAND);
+			}
+			else
+			{
+				DrawLimb(aUsers[i], XN_SKEL_RIGHT_WRIST, XN_SKEL_RIGHT_HAND);
+				DrawLimb(aUsers[i], XN_SKEL_RIGHT_HAND, XN_SKEL_RIGHT_FINGERTIP);
+			}
+
+			DrawLimb(aUsers[i], XN_SKEL_LEFT_SHOULDER, XN_SKEL_TORSO);
+			DrawLimb(aUsers[i], XN_SKEL_RIGHT_SHOULDER, XN_SKEL_TORSO);
+
+			DrawLimb(aUsers[i], XN_SKEL_TORSO, XN_SKEL_LEFT_HIP);
+			DrawLimb(aUsers[i], XN_SKEL_LEFT_HIP, XN_SKEL_LEFT_KNEE);
+			DrawLimb(aUsers[i], XN_SKEL_LEFT_KNEE, XN_SKEL_LEFT_FOOT);
+
+			DrawLimb(aUsers[i], XN_SKEL_TORSO, XN_SKEL_RIGHT_HIP);
+			DrawLimb(aUsers[i], XN_SKEL_RIGHT_HIP, XN_SKEL_RIGHT_KNEE);
+			DrawLimb(aUsers[i], XN_SKEL_RIGHT_KNEE, XN_SKEL_RIGHT_FOOT);
+
+			DrawLimb(aUsers[i], XN_SKEL_LEFT_HIP, XN_SKEL_RIGHT_HIP);
+#ifndef USE_GLES
+			glEnd();
+#endif
+		}
+	}
+
+	if (g_bPrintFrameID)
+	{
+		static XnChar strFrameID[80];
+		xnOSMemSet(strFrameID, 0, 80);
+		XnUInt32 nDummy = 0;
+		xnOSStrFormat(strFrameID, sizeof(strFrameID), &nDummy, "%d", dmd.FrameID());
+
+		glColor4f(1, 0, 0, 1);
+
+		glRasterPos2i(10, 10);
+
+		glPrintString(GLUT_BITMAP_HELVETICA_18, strFrameID);
+	}
+}
